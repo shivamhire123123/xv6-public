@@ -6,7 +6,6 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
-#include <stdlib.h>
 
 struct {
   struct spinlock lock;
@@ -17,6 +16,7 @@ struct {
 } ptable;
 
 static struct proc *initproc;
+void change_state(struct proc *p, enum procstate state);
 
 int nextpid = 1;
 extern void forkret(void);
@@ -24,14 +24,21 @@ extern void trapret(void);
 
 static void wakeup1(void *chan);
 
+unsigned short lfsr = 0xACE1u;
+unsigned bit;
+
+unsigned rand()
+{
+	bit  = ((lfsr >> 0) ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5) ) & 1;
+	return lfsr =  (lfsr >> 1) | (bit << 15);
+}
+
 void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
-  acquire(&ptable.lock);
   ptable.remaining_tickets = NUMTIC;
   ptable.num_tickets = -1;
-  release(&ptable.lock);
 }
 
 // Must be called with interrupts disabled
@@ -164,8 +171,7 @@ userinit(void)
   // writes to be visible, and the lock is also needed
   // because the assignment might not be atomic.
   acquire(&ptable.lock);
-
-  _settickets(p, 1);
+  p->num_tickets = 1;
   change_state(p, RUNNABLE);
 //  p->state = RUNNABLE;
 
@@ -235,7 +241,8 @@ fork(void)
   acquire(&ptable.lock);
 
   // TODO check if curproc->num_tickets were allocated to np
-  _settickets(np, curproc->num_tickets);
+  np->num_tickets = 0;
+  inctickets(np, curproc->num_tickets);
   change_state(np, RUNNABLE);
 //  np->state = RUNNABLE;
 
@@ -336,8 +343,29 @@ wait(void)
   }
 }
 
+void cps(void) {
+  	static char *states[] = {
+  	[UNUSED]    "unused",
+  	[EMBRYO]    "embryo",
+  	[SLEEPING]  "sleep ",
+  	[RUNNABLE]  "runble",
+  	[RUNNING]   "run   ",
+  	[ZOMBIE]    "zombie"
+  	};
+	struct proc *p;
+	acquire(&ptable.lock);
+	cprintf("name \t pid \t state \t num_tickets \t ticks \t \n");
+	for(p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+		if(p->state != UNUSED) {
+			cprintf("%s \t %d \t %s \t %d \t %d \t \n", p->name, p-> pid,
+					states[p->state], p->num_tickets, p->ticks);
+		}
+	}
+	release(&ptable.lock);
+}
+
 // ptable lock must be already held
-uint _settickets(struct proc *p, uint num) {
+uint inctickets(struct proc *p, uint num) {
 	if(num > ptable.remaining_tickets) {
 		num = ptable.remaining_tickets;
 	}
@@ -346,11 +374,47 @@ uint _settickets(struct proc *p, uint num) {
 	return num;
 }
 
+int dectickets(struct proc *p, int num) {
+	if(p->num_tickets < (-num)) {
+		return 0;
+	}
+	p->num_tickets += num;
+	ptable.remaining_tickets -= num;
+	return num;
+}
+
+int settickets(int number) {
+	struct proc *p = myproc();
+	int ret;
+	if(number <= 0) {
+		return -1;
+	}
+	int prev_tic = p->num_tickets;
+	number -= prev_tic;
+	int new_tic;
+	acquire(&ptable.lock);
+	if(number < 0) {
+		new_tic = dectickets(p, number);
+		ret = 0;
+	}
+	else {
+		new_tic = inctickets(p, number);
+		ret = 0;
+		if(new_tic != number) {
+			dectickets(p, - new_tic);
+			ret = -1;
+		}
+	}
+	release(&ptable.lock);
+	return ret;
+}
+
+
 // ptable lock must be already held
 void change_state(struct proc *p, enum procstate state) {
 	if(p->state == RUNNABLE && state != RUNNABLE) {
 		for(int i = 0; i < ptable.num_tickets; i++) {
-			if(ptable.tickets[i] == p->pid) {
+			if(ptable.tickets[i] == p) {
 				for(int j = i; j < ptable.num_tickets - 1; j++) {
 					ptable.tickets[j] = ptable.tickets[j + 1];
 				}
@@ -381,7 +445,7 @@ scheduler(void)
   struct proc *p;
   struct cpu *c = mycpu();
   c->proc = 0;
-  
+
   for(;;){
     // Enable interrupts on this processor.
     sti();
@@ -413,7 +477,6 @@ scheduler(void)
       c->proc = 0;
     }
     release(&ptable.lock);
-
   }
 }
 
