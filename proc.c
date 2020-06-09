@@ -6,10 +6,14 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include <stdlib.h>
 
 struct {
   struct spinlock lock;
   struct proc proc[NPROC];
+  struct proc* tickets[NUMTIC];
+  uint remaining_tickets;
+  uint num_tickets;
 } ptable;
 
 static struct proc *initproc;
@@ -24,6 +28,10 @@ void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
+  acquire(&ptable.lock);
+  ptable.remaining_tickets = NUMTIC;
+  ptable.num_tickets = -1;
+  release(&ptable.lock);
 }
 
 // Must be called with interrupts disabled
@@ -78,15 +86,18 @@ allocproc(void)
 
   acquire(&ptable.lock);
 
+  // search for UNUSED process slot in ptable
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
     if(p->state == UNUSED)
       goto found;
 
+  // if not found return 0
   release(&ptable.lock);
   return 0;
 
 found:
-  p->state = EMBRYO;
+  change_state(p, EMBRYO);
+//  p->state = EMBRYO;
   p->pid = nextpid++;
 
   release(&ptable.lock);
@@ -110,6 +121,7 @@ found:
   sp -= sizeof *p->context;
   p->context = (struct context*)sp;
   memset(p->context, 0, sizeof *p->context);
+  // to simulate that the context swtch was called by forkret
   p->context->eip = (uint)forkret;
 
   return p;
@@ -123,11 +135,15 @@ userinit(void)
   struct proc *p;
   extern char _binary_initcode_start[], _binary_initcode_size[];
 
-  p = allocproc();
+  p = allocproc();				// allocate a pcb: allocate kstack with user reg
+  								// trapret, the 5 register with eip==forkret
   
   initproc = p;
   if((p->pgdir = setupkvm()) == 0)
     panic("userinit: out of memory?");
+  // _binary_initcode_start - an array which content code to be executed in user
+  // mode by the first process map to vm 0
+  // content of _binary_initcode_start is in file initcode.S
   inituvm(p->pgdir, _binary_initcode_start, (int)_binary_initcode_size);
   p->sz = PGSIZE;
   memset(p->tf, 0, sizeof(*p->tf));
@@ -141,6 +157,7 @@ userinit(void)
 
   safestrcpy(p->name, "initcode", sizeof(p->name));
   p->cwd = namei("/");
+  p->ticks = 0;
 
   // this assignment to p->state lets other cores
   // run this process. the acquire forces the above
@@ -148,7 +165,9 @@ userinit(void)
   // because the assignment might not be atomic.
   acquire(&ptable.lock);
 
-  p->state = RUNNABLE;
+  _settickets(p, 1);
+  change_state(p, RUNNABLE);
+//  p->state = RUNNABLE;
 
   release(&ptable.lock);
 }
@@ -211,10 +230,14 @@ fork(void)
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
 
   pid = np->pid;
+  np->ticks = 0;
 
   acquire(&ptable.lock);
 
-  np->state = RUNNABLE;
+  // TODO check if curproc->num_tickets were allocated to np
+  _settickets(np, curproc->num_tickets);
+  change_state(np, RUNNABLE);
+//  np->state = RUNNABLE;
 
   release(&ptable.lock);
 
@@ -262,7 +285,8 @@ exit(void)
   }
 
   // Jump into the scheduler, never to return.
-  curproc->state = ZOMBIE;
+  change_state(curproc, ZOMBIE);
+//  curproc->state = ZOMBIE;
   sched();
   panic("zombie exit");
 }
@@ -294,7 +318,8 @@ wait(void)
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;
-        p->state = UNUSED;
+		change_state(p, UNUSED);
+//        p->state = UNUSED;
         release(&ptable.lock);
         return pid;
       }
@@ -309,6 +334,37 @@ wait(void)
     // Wait for children to exit.  (See wakeup1 call in proc_exit.)
     sleep(curproc, &ptable.lock);  //DOC: wait-sleep
   }
+}
+
+// ptable lock must be already held
+uint _settickets(struct proc *p, uint num) {
+	if(num > ptable.remaining_tickets) {
+		num = ptable.remaining_tickets;
+	}
+	p->num_tickets += num;
+	ptable.remaining_tickets -= num;
+	return num;
+}
+
+// ptable lock must be already held
+void change_state(struct proc *p, enum procstate state) {
+	if(p->state == RUNNABLE && state != RUNNABLE) {
+		for(int i = 0; i < ptable.num_tickets; i++) {
+			if(ptable.tickets[i] == p->pid) {
+				for(int j = i; j < ptable.num_tickets - 1; j++) {
+					ptable.tickets[j] = ptable.tickets[j + 1];
+				}
+				ptable.num_tickets--;
+			}
+		}
+	}
+	else if(p->state != RUNNABLE && state == RUNNABLE) {
+		int lst = ptable.num_tickets + p->num_tickets;
+		for(int i = ptable.num_tickets; i < lst; i++) {
+			ptable.tickets[i] = p;
+		}
+	}
+	p->state = state;
 }
 
 //PAGEBREAK: 42
@@ -332,7 +388,9 @@ scheduler(void)
 
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    for(int i = 0; i < NPROC; i++){
+//    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+	  p = ptable.tickets[rand() % ptable.num_tickets];
       if(p->state != RUNNABLE)
         continue;
 
@@ -340,8 +398,12 @@ scheduler(void)
       // to release ptable.lock and then reacquire it
       // before jumping back to us.
       c->proc = p;
+	  // loads p's page table into CR3
+	  // also loads stack base pointers in tss
       switchuvm(p);
-      p->state = RUNNING;
+	  change_state(p, RUNNING);
+	  p->ticks++;
+//      p->state = RUNNING;
 
       swtch(&(c->scheduler), p->context);
       switchkvm();
@@ -386,7 +448,8 @@ void
 yield(void)
 {
   acquire(&ptable.lock);  //DOC: yieldlock
-  myproc()->state = RUNNABLE;
+  change_state(myproc(), RUNNABLE);
+//  myproc()->state = RUNNABLE;
   sched();
   release(&ptable.lock);
 }
@@ -437,7 +500,8 @@ sleep(void *chan, struct spinlock *lk)
   }
   // Go to sleep.
   p->chan = chan;
-  p->state = SLEEPING;
+  change_state(p, SLEEPING);
+//  p->state = SLEEPING;
 
   sched();
 
@@ -461,7 +525,8 @@ wakeup1(void *chan)
 
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
     if(p->state == SLEEPING && p->chan == chan)
-      p->state = RUNNABLE;
+		change_state(p, RUNNABLE);
+//      p->state = RUNNABLE;
 }
 
 // Wake up all processes sleeping on chan.
@@ -487,7 +552,8 @@ kill(int pid)
       p->killed = 1;
       // Wake process from sleep if necessary.
       if(p->state == SLEEPING)
-        p->state = RUNNABLE;
+		  change_state(p, RUNNABLE);
+//        p->state = RUNNABLE;
       release(&ptable.lock);
       return 0;
     }

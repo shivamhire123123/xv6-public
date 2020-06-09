@@ -6,6 +6,8 @@
 
 
 # exec(init, argv)
+# make system call for exec which runs init with argument as argv
+# init and argv are global variables
 .globl start
 start:
   pushl $argv
