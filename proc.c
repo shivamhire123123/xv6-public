@@ -38,7 +38,7 @@ pinit(void)
 {
   initlock(&ptable.lock, "ptable");
   ptable.remaining_tickets = NUMTIC;
-  ptable.num_tickets = -1;
+  ptable.num_tickets = 0;
 }
 
 // Must be called with interrupts disabled
@@ -103,8 +103,7 @@ allocproc(void)
   return 0;
 
 found:
-  change_state(p, EMBRYO);
-//  p->state = EMBRYO;
+  p->state = EMBRYO;
   p->pid = nextpid++;
 
   release(&ptable.lock);
@@ -419,6 +418,7 @@ void change_state(struct proc *p, enum procstate state) {
 					ptable.tickets[j] = ptable.tickets[j + 1];
 				}
 				ptable.num_tickets--;
+				ptable.remaining_tickets++;
 			}
 		}
 	}
@@ -426,6 +426,8 @@ void change_state(struct proc *p, enum procstate state) {
 		int lst = ptable.num_tickets + p->num_tickets;
 		for(int i = ptable.num_tickets; i < lst; i++) {
 			ptable.tickets[i] = p;
+			ptable.num_tickets++;
+			ptable.remaining_tickets--;
 		}
 	}
 	p->state = state;
@@ -454,8 +456,10 @@ scheduler(void)
     acquire(&ptable.lock);
     for(int i = 0; i < NPROC; i++){
 //    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+	  if(ptable.num_tickets == 0)
+		  continue;
 	  p = ptable.tickets[rand() % ptable.num_tickets];
-      if(p->state != RUNNABLE)
+      if(p == 0 || p->state != RUNNABLE)
         continue;
 
       // Switch to chosen process.  It is the process's job
