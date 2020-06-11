@@ -24,13 +24,12 @@ extern void trapret(void);
 
 static void wakeup1(void *chan);
 
-unsigned short lfsr = 0xACE1u;
-unsigned bit;
-
-unsigned rand()
+unsigned long randstate = 1;
+unsigned int
+rand()
 {
-	bit  = ((lfsr >> 0) ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5) ) & 1;
-	return lfsr =  (lfsr >> 1) | (bit << 15);
+  randstate = randstate * 1664525 + 1013904223;
+  return randstate;
 }
 
 void
